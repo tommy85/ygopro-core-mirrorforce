@@ -650,6 +650,7 @@ public:
 	static int32_t group_meta_sub(lua_State *L);
 	static int32_t group_meta_band(lua_State *L);
 	static int32_t group_meta_bxor(lua_State *L);
+	static int32_t group_gc(lua_State *L);
 
 	//preload
 	static int32_t debug_message(lua_State *L);
@@ -663,6 +664,16 @@ public:
 	static int32_t debug_reload_field_end(lua_State *L);
 	static int32_t debug_set_ai_name(lua_State *L);
 	static int32_t debug_show_hint(lua_State *L);
+	// state restore: the write side of query_effect_info / query_duel_state.
+	// Additive only -- these touch no existing code path; see libdebug.cpp.
+	static int32_t debug_set_card_state(lua_State *L);
+	static int32_t debug_set_count_code(lua_State *L);
+	static int32_t debug_set_spsummon_once(lua_State *L);
+	static int32_t debug_set_turn_counters(lua_State *L);
+	static int32_t debug_set_activity_count(lua_State *L);
+	static int32_t debug_set_turn_info(lua_State *L);
+	static int32_t debug_permute_hidden(lua_State *L);
+	static int32_t debug_force_shuffle(lua_State *L);
 	static void open_debuglib(lua_State *L);
 };
 

@@ -51,16 +51,28 @@ public:
 	int32_t no_action{};
 	int32_t call_depth{};
 	bool enable_unsafe_feature{};
+	// Script temporaries: the weak-valued table anchoring weak groups (a registry reference) and its free slots.
+	// Slots are integers handed out here, never by luaL_ref, whose border search would land in the holes the
+	// collector leaves; the free list is LIFO, so slot reuse follows the sequence of calls, not addresses.
+	int32_t weak_groups{};
+	int32_t weak_group_next{ 1 };
+	std::vector<int32_t> weak_group_free;
+	// estimated C++ bytes of the groups turned weak since the last full collection (see return_temporary_group)
+	uint32_t weak_group_bytes{};
+	static constexpr uint32_t WEAK_GROUP_COLLECT_BYTES = 2u << 20;
 
 	explicit interpreter(duel* pd, bool enable_unsafe_libraries);
 	~interpreter();
 
 	void register_card(card* pcard);
+	bool rebind_card(card* pcard);
 	void unregister_card(card* pcard);
 	void register_effect(effect* peffect);
 	void unregister_effect(effect* peffect);
 	void register_group(group* pgroup);
-	void unregister_group(group* pgroup);
+	void unregister_group(group* pgroup, std::vector<int32_t>* released_slots = nullptr);
+	void hold_group(group* pgroup);
+	void clear_weak_slot(int32_t slot);
 
 	int32_t load_script(const char* script_name);
 	int32_t load_card_script(uint32_t code);
@@ -81,6 +93,7 @@ public:
 
 	static void card2value(lua_State* L, card* pcard);
 	static void group2value(lua_State* L, group* pgroup);
+	static void return_temporary_group(lua_State* L, group* pgroup);
 	static void effect2value(lua_State* L, effect* peffect);
 	static void function2value(lua_State* L, int32_t func_ref);
 	static int32_t get_function_handle(lua_State* L, int32_t index);
@@ -92,6 +105,17 @@ public:
 		return std::snprintf(buffer, N, format, args...);
 	}
 };
+
+// The core refuses to go on with this duel: throws std::runtime_error("ygopro-core refusal [<reason>]: <detail>"),
+// which reaches the host through the api call that ran into it (as std::bad_alloc does), never a script error the
+// duel absorbs. Reasons: released_group (a script used a group the core had already released),
+// weak_group_invariant (the core named a weak group it no longer anchors), group_audit (diagnostic builds: a C++
+// structure kept a weak group), gc_pressure_setting (diagnostic builds: a malformed MF_CORE_GC_PRESSURE).
+[[noreturn]] void mf_core_refusal(const char* reason, const char* detail);
+#ifdef MF_GROUP_AUDIT
+// Diagnostic builds only: MF_CORE_GC_PRESSURE="pause,stepmul" runs every duel's collector that aggressively.
+void mf_group_audit_gc_pressure(lua_State* L);
+#endif
 
 #define COROUTINE_FINISH	1
 #define COROUTINE_YIELD		2

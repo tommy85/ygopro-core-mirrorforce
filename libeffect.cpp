@@ -261,6 +261,8 @@ int32_t scriptlib::effect_set_label_object(lua_State *L) {
 		peffect->object_type = PARAM_TYPE_EFFECT;
 	} else if(check_param(L, PARAM_TYPE_GROUP, 2, TRUE)) {
 		group* p = *(group**)lua_touserdata(L, 2);
+		// the label keeps the group's registry reference: a weak group turns strong first
+		p->pduel->lua->hold_group(p);
 		peffect->label_object = p->ref_handle;
 		peffect->object_type = PARAM_TYPE_GROUP;
 	} else
@@ -549,6 +551,7 @@ int32_t scriptlib::effect_is_cost_checked(lua_State *L) {
 	check_param_count(L, 1);
 	check_param(L, PARAM_TYPE_EFFECT, 1);
 	effect* peffect = *(effect**)lua_touserdata(L, 1);
+	peffect->reads_cost_check = TRUE;
 	lua_pushboolean(L, peffect->cost_checked);
 	return 1;
 }

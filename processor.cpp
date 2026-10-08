@@ -13,6 +13,7 @@
 #include "interpreter.h"
 #include "ocgapi.h"
 #include <iterator>
+#include <tuple>
 
 void field::add_process(uint16_t type, uint16_t step, effect* peffect, group* target, int32_t arg1, int32_t arg2, int32_t arg3, int32_t arg4, void* ptr1, void* ptr2) {
 	processor_unit new_unit;
@@ -32,6 +33,24 @@ void field::add_process(uint16_t type, uint16_t step, effect* peffect, group* ta
 #pragma warning(push)
 #pragma warning(disable: 4244)
 #endif
+// Delayed quick entries by effect-id order, then by the event's values and the ids of the cards and effect it
+// names. std::less on their pointers (delayed_effect_sort) follows the heap layout.
+static uint64_t group_order_key(group* pgroup) {
+	if(!pgroup || pgroup->container.empty())
+		return 0;
+	return (*pgroup->container.begin())->sortid + 1;
+}
+static bool delayed_entry_order(const std::pair<effect*, tevent>& lhs, const std::pair<effect*, tevent>& rhs) {
+	if(lhs.first != rhs.first)
+		return effect_sort_id(lhs.first, rhs.first);
+	auto key = [](const tevent& e) {
+		return std::make_tuple(e.event_code, e.event_value, e.reason, e.event_player, e.reason_player,
+			e.trigger_card ? e.trigger_card->cardid + 1 : uint64_t(0),
+			e.reason_effect ? uint64_t(e.reason_effect->id) + 1 : uint64_t(0),
+			group_order_key(e.event_cards), e.event_cards ? e.event_cards->container.size() : size_t(0));
+	};
+	return key(lhs.second) < key(rhs.second);
+}
 uint32_t field::process() {
 	if (core.subunits.size())
 		core.units.splice(core.units.begin(), core.subunits);
@@ -1039,7 +1058,7 @@ int32_t field::process_phase_event(int16_t step, int32_t phase) {
 			++cn_count;
 		}
 		//all effects taking control non-permanently are only until End Phase, not until Turn end
-		for(auto& peffect : effects.pheff) {
+		for(effect* peffect : effects_by_id(effects.pheff)) {
 			if(peffect->code != EFFECT_SET_CONTROL)
 				continue;
 			if(!(peffect->reset_flag & phase))
@@ -1131,6 +1150,13 @@ int32_t field::process_phase_event(int16_t step, int32_t phase) {
 			}
 		}
 		if(core.select_chains.size() == 0) {
+			if(pduel->phase_pass_audit_enabled) {
+				if(pduel->phase_pass_audit_count == duel::PHASE_PASS_AUDIT_CAPACITY)
+					pduel->phase_pass_audit_overflow = true;
+				else pduel->phase_pass_audit[pduel->phase_pass_audit_count++] = {
+					pduel->buffer_size(), infos.turn_id, infos.phase, uint8_t(check_player),
+					uint8_t(core.units.begin()->arg2 & 0x1)};
+			}
 			returns.ivalue[0] = -1;
 			core.units.begin()->step = 1;
 			return FALSE;
@@ -1600,8 +1626,16 @@ int32_t field::process_quick_effect(int16_t step, int32_t skip_freechain, uint8_
 		if(core.units.begin()->arg3)
 			check_player = 1 - infos.turn_player;
 		core.select_chains.clear();
-		for(auto ifit = core.quick_f_chain.begin(); ifit != core.quick_f_chain.end(); ) {
-			effect* peffect = ifit->first;
+		// The forced quick chains in effect-id order: quick_f_chain is keyed, and so ordered, by address,
+		// and this order is the order of the chain menu.
+		effect_set forced;
+		for(auto& it : core.quick_f_chain)
+			forced.push_back(it.first);
+		std::sort(forced.begin(), forced.end(), effect_sort_id);
+		for(effect* peffect : forced) {
+			auto ifit = core.quick_f_chain.find(peffect);
+			if(ifit == core.quick_f_chain.end())
+				continue;
 			card* phandler = peffect->get_handler();
 			if(peffect->is_chainable(ifit->second.triggering_player) && peffect->check_count_limit(ifit->second.triggering_player)
 					&& phandler->is_has_relation(ifit->second)) {
@@ -1609,11 +1643,8 @@ int32_t field::process_quick_effect(int16_t step, int32_t skip_freechain, uint8_
 					ifit->second.flag |= CHAIN_FORCED;
 					core.select_chains.push_back(ifit->second);
 				}
-			} else {
-				ifit = core.quick_f_chain.erase(ifit);
-				continue;
-			}
-			++ifit;
+			} else
+				core.quick_f_chain.erase(ifit);
 		}
 		if(core.select_chains.size() == 0)
 			returns.ivalue[0] = -1;
@@ -1730,11 +1761,15 @@ int32_t field::process_quick_effect(int16_t step, int32_t skip_freechain, uint8_
 					core.delayed_quick.emplace(peffect, ev);
 			}
 		}
-		// delayed quick
-		for(auto eit = core.delayed_quick.begin(); eit != core.delayed_quick.end();) {
-			effect* peffect = eit->first;
-			const tevent& evt = eit->second;
-			++eit;
+		// delayed quick, in a deterministic order: delayed_quick is ordered by address, and this order is the
+		// order of the chain menu and of the chain ids taken below
+		std::vector<std::pair<effect*, tevent>> delayed(core.delayed_quick.begin(), core.delayed_quick.end());
+		std::stable_sort(delayed.begin(), delayed.end(), delayed_entry_order);
+		for(const auto& entry : delayed) {
+			if(!core.delayed_quick.count(entry))
+				continue;  // removed while an earlier entry was checked
+			effect* peffect = entry.first;
+			const tevent& evt = entry.second;
 			peffect->set_activate_location();
 			if(peffect->is_chainable(priority) && peffect->is_activateable(priority, evt, TRUE)) {
 				card* phandler = peffect->get_handler();
@@ -3688,7 +3723,10 @@ int32_t field::process_turn(uint16_t step, uint8_t turn_player) {
 				pduel->delete_group(ev.event_cards);
 		}
 		core.used_event.clear();
-		for(auto& peffect : core.reseted_effects) {
+		// Delete in effect-id order, not in address order: freeing returns script references for reuse.
+		effect_set reseted(core.reseted_effects.begin(), core.reseted_effects.end());
+		std::sort(reseted.begin(), reseted.end(), effect_sort_id);
+		for(auto& peffect : reseted) {
 			pduel->delete_effect(peffect);
 		}
 		core.reseted_effects.clear();
@@ -4065,6 +4103,7 @@ int32_t field::add_chain(uint16_t step) {
 		if(peffect->type & EFFECT_TYPE_ACTIVATE) {
 			clit.set_triggering_state(phandler);
 		}
+		pduel->chain_forced(peffect);
 		pduel->write_buffer8(MSG_CHAINING);
 		pduel->write_buffer32(phandler->data.code);
 		pduel->write_buffer32(phandler->get_info_location());
@@ -4500,6 +4539,7 @@ int32_t field::solve_chain(uint16_t step, uint32_t chainend_arg1, uint32_t chain
 			add_process(PROCESSOR_SOLVE_CONTINUOUS, 0, 0, 0, 0, 0);
 		} else
 			core.conti_player = PLAYER_NONE;
+		pduel->solve_forced(cait->triggering_effect);
 		pduel->write_buffer8(MSG_CHAIN_SOLVED);
 		pduel->write_buffer8(cait->chain_count);
 		raise_event(nullptr, EVENT_CHAIN_SOLVED, cait->triggering_effect, 0, cait->triggering_player, cait->triggering_player, cait->chain_count);
@@ -4572,6 +4612,7 @@ int32_t field::solve_chain(uint16_t step, uint32_t chainend_arg1, uint32_t chain
 	}
 	case 12: {
 		core.used_event.splice(core.used_event.end(), core.point_event);
+		pduel->forced_link_count = 0;
 		pduel->write_buffer8(MSG_CHAIN_END);
 		for(auto& ch_lim_p : core.chain_limit_p)
 			luaL_unref(pduel->lua->lua_state, LUA_REGISTRYINDEX, ch_lim_p.function);

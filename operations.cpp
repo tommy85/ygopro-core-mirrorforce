@@ -336,6 +336,8 @@ void field::select_tribute_cards(card* target, uint8_t playerid, uint8_t cancela
 int32_t field::draw(uint16_t step, effect* reason_effect, uint32_t reason, uint8_t reason_player, uint8_t playerid, int32_t count) {
 	switch(step) {
 	case 0: {
+		if(count > 0)
+			pduel->tactical_audit.order(playerid);
 		card_vector cv;
 		uint32_t public_count = 0;
 		if(!(reason & REASON_RULE) && !is_player_can_draw(playerid)) {
@@ -2653,6 +2655,32 @@ int32_t field::sset_g(uint16_t step, uint8_t setplayer, uint8_t toplayer, group*
 			--ct;
 		if(ct <= 1)
 			return FALSE;
+		if(pduel->shuffle_plan.active()) {
+			// This is NOT a chance shuffle. set_group_seq came from the earlier
+			// legal SELECT_PLACE responses. Verify that natural result only.
+			std::vector<uint32_t> positions;
+			for(card* pc : core.operated_set)
+				if(!(pc->data.type & TYPE_FIELD))
+					positions.push_back(pc->current.sequence);
+			std::sort(positions.begin(), positions.end());
+			std::vector<card*> before(positions.size()), after(positions.size(), nullptr);
+			for(size_t i = 0; i < positions.size(); ++i)
+				before[i] = player[toplayer].list_szone[positions[i]];
+			uint32_t index = 0;
+			for(card* pc : core.operated_set) {
+				uint32_t seq = core.set_group_seq[index++];
+				if(pc->data.type & TYPE_FIELD)
+					continue;
+				auto at = std::lower_bound(positions.begin(), positions.end(), seq);
+				if(at == positions.end() || *at != seq) {
+					pduel->shuffle_plan.fail(mf_shuffle_plan::EVENT_SHAPE);
+					break;
+				}
+				after[at - positions.begin()] = pc;
+			}
+			pduel->shuffle_plan.consume(pduel, MSG_SHUFFLE_SET_CARD, toplayer, LOCATION_SZONE,
+			                           positions, before, after, 4);
+		}
 		pduel->write_buffer8(MSG_SHUFFLE_SET_CARD);
 		pduel->write_buffer8(LOCATION_SZONE);
 		pduel->write_buffer8(ct);
@@ -2728,6 +2756,23 @@ int32_t field::special_summon_rule(uint16_t step, uint8_t sumplayer, card* targe
 		effect* peffect = core.select_effects[returns.ivalue[0]];
 		core.units.begin()->peffect = peffect;
 		if(peffect->code == EFFECT_SPSUMMON_PROC_G) {
+			// The Pendulum Summon branch never reads the Synchro/Xyz/Link limits of a Duel.SynchroSummon,
+			// Duel.XyzSummon or Duel.LinkSummon: release their copies here as steps 4 and 18 do, or they
+			// leak and restrict this player's next summon rule.
+			core.limit_tuner = 0;
+			if(core.limit_syn) {
+				pduel->delete_group(core.limit_syn);
+				core.limit_syn = 0;
+			}
+			if(core.limit_xyz) {
+				pduel->delete_group(core.limit_xyz);
+				core.limit_xyz = 0;
+			}
+			core.limit_link_card = 0;
+			if(core.limit_link) {
+				pduel->delete_group(core.limit_link);
+				core.limit_link = 0;
+			}
 			core.units.begin()->step = 19;
 			return FALSE;
 		}
@@ -3595,7 +3640,11 @@ int32_t field::destroy(uint16_t step, group * targets, effect * reason_effect, u
 				targets->container.insert(rep);
 			}
 		}
-		for (auto& peffect : indestructable_effect_set) {
+		// Count uses and write hints in effect-id order: std::set<effect*> is ordered by address, which
+		// follows the process's heap layout.
+		effect_set used_indestructable(indestructable_effect_set.begin(), indestructable_effect_set.end());
+		std::sort(used_indestructable.begin(), used_indestructable.end(), effect_sort_id);
+		for (auto& peffect : used_indestructable) {
 			peffect->dec_count();
 			pduel->write_buffer8(MSG_HINT);
 			pduel->write_buffer8(HINT_CARD);
@@ -4223,7 +4272,8 @@ int32_t field::send_to(uint16_t step, group * targets, effect * reason_effect, u
 		}
 		if(param->predirect->operation) {
 			tevent e;
-			e.event_cards = targets;
+			// the sent group: from step 4 on, `targets` is this unit's exargs, not a group
+			e.event_cards = param->targets;
 			e.event_player = pcard->current.controler;
 			e.event_value = 0;
 			e.reason = pcard->current.reason;
@@ -4404,6 +4454,8 @@ int32_t field::send_to(uint16_t step, group * targets, effect * reason_effect, u
 int32_t field::discard_deck(uint16_t step, uint8_t playerid, uint8_t count, uint32_t reason) {
 	switch(step) {
 	case 0: {
+		if(count > 0)
+			pduel->tactical_audit.order(playerid);
 		if(is_player_affected_by_effect(playerid, EFFECT_CANNOT_DISCARD_DECK)) {
 			core.operated_set.clear();
 			returns.ivalue[0] = 0;
@@ -6416,14 +6468,14 @@ int32_t field::toss_coin(uint16_t step, effect * reason_effect, uint8_t reason_p
 				pduel->write_buffer8((uint8_t)count);
 				core.coin_count = count;
 				for (int32_t i = 0; i < count; ++i) {
-					core.coin_result[i] = pduel->get_next_integer(0, 1);
+					core.coin_result[i] = pduel->get_next_outcome(0, 1);
 					pduel->write_buffer8(core.coin_result[i]);
 				}
 			}
 			else if (count == -1) {
 				core.coin_count = 0;
 				for (int32_t i = 0; i < MAX_COIN_COUNT; ++i) {
-					core.coin_result[i] = pduel->get_next_integer(0, 1);
+					core.coin_result[i] = pduel->get_next_outcome(0, 1);
 					if (!core.coin_result[i]) {
 						core.coin_count = i + 1;
 						break;
@@ -6483,7 +6535,7 @@ int32_t field::toss_dice(uint16_t step, effect * reason_effect, uint8_t reason_p
 			pduel->write_buffer8(playerid);
 			pduel->write_buffer8(count1);
 			for(int32_t i = 0; i < count1; ++i) {
-				core.dice_result[i] = pduel->get_next_integer(1, 6);
+				core.dice_result[i] = pduel->get_next_outcome(1, 6);
 				pduel->write_buffer8(core.dice_result[i]);
 			}
 			if(count2 > 0) {
@@ -6491,7 +6543,7 @@ int32_t field::toss_dice(uint16_t step, effect * reason_effect, uint8_t reason_p
 				pduel->write_buffer8(1 - playerid);
 				pduel->write_buffer8(count2);
 				for(int32_t i = 0; i < count2; ++i) {
-					core.dice_result[count1 + i] = pduel->get_next_integer(1, 6);
+					core.dice_result[count1 + i] = pduel->get_next_outcome(1, 6);
 					pduel->write_buffer8(core.dice_result[count1 + i]);
 				}
 			}

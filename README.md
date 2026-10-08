@@ -3,6 +3,18 @@
 ## Introduction
 The core logic and lua script processor of YGOPro. This library can be made external of the project and used to power server technologies. It maintains a state engine that is manipulated by Lua scripts using manipulation functions it exposes.
 
+## MirrorForce changes
+
+This fork carries the engine changes used by [MirrorForce](https://github.com/tommy85/MirrorForce), a self-play
+reinforcement-learning agent for Yu-Gi-Oh! OCG:
+
+- deterministic effect iteration and thread-safe global state, so many duels can run in one process;
+- whole-duel snapshots and rollback (`mfsnap.*`, an arena allocator based on dlmalloc), used by play-time search;
+- `Debug.PermuteHidden` and related helpers that replace hidden cards with another consistent assignment;
+- a viewer-scoped state API (`query_duel_state`) and read-only query helpers for agents and offline labels.
+
+The upstream API is unchanged; the additions are new exported functions declared in `ocgapi.h`.
+
 ## Compiling
 In most cases, what you want to compile is the main program of YGOPro. You should refer to the main YGOPro project's [wiki](https://github.com/Fluorohydride/ygopro/wiki).
 If you want to compile the dynamic link library of this repository (ocgcore.dll), you can refer to [this script](https://github.com/Fluorohydride/ygopro-core/blob/master/.github/workflows/build.yml).
@@ -75,4 +87,3 @@ The default script reader using `fread`.
 - `libduel.cpp`
 - `libeffect.cpp`
 - `libgroup.cpp`
-

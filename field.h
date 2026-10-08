@@ -177,6 +177,7 @@ struct delayed_effect_sort {
 	bool operator()(const std::pair<effect*, tevent>& lhs, const std::pair<effect*, tevent>& rhs) const;
 };
 using delayed_effect_collection = std::set<std::pair<effect*, tevent>, delayed_effect_sort>;
+std::vector<effect*> effects_by_id(const effect_collection& collection);
 using activity_map = std::unordered_map<int32_t, std::pair<int32_t, uint32_t>>;	// (counter_id, (counter_filter, count[1]|count[0]))
 struct processor {
 	struct chain_limit_t {
@@ -334,6 +335,8 @@ struct processor {
 	uint8_t shuffle_check_disabled{ FALSE };
 	uint8_t shuffle_hand_check[2]{};
 	uint8_t shuffle_deck_check[2]{};
+	// Debug.ForceShuffle: the order the next shuffle of a player's hand, deck or extra deck leaves (used once)
+	std::vector<uint32_t> forced_shuffle[2][3];
 	uint8_t deck_reversed{ FALSE };
 	uint8_t remove_brainwashing{ FALSE };
 	uint8_t flip_delayed{ FALSE };
@@ -360,6 +363,10 @@ struct processor {
 	activity_map chain_counter;
 	processor_list recover_damage_reserve;
 	effect_vector dec_count_reserve;
+	// Duel.SelectTarget calls that found fewer candidates than their minimum (query_target_shortfall), and the
+	// handler code of the last one's chain link
+	uint32_t target_shortfalls{ 0 };
+	uint32_t target_shortfall_code{ 0 };
 };
 class field {
 public:
@@ -373,7 +380,7 @@ public:
 	return_value returns{};
 	tevent nil_event;
 
-	static int32_t field_used_count[32];
+	static const int32_t field_used_count[32];
 	explicit field(duel* pd);
 	~field() = default;
 	void reload_field_info();
@@ -407,6 +414,7 @@ public:
 	int32_t check_extra_link(int32_t playerid, card* pcard, int32_t sequence);
 	void get_cards_in_zone(card_set* cset, uint32_t zone, int32_t playerid, int32_t location);
 	void shuffle(uint8_t playerid, uint8_t location);
+	void apply_forced_shuffle(uint8_t playerid, uint8_t location, card_vector& svector, int32_t count);
 	void reset_sequence(uint8_t playerid, uint8_t location);
 	void swap_deck_and_grave(uint8_t playerid);
 	void reverse_deck(uint8_t playerid);

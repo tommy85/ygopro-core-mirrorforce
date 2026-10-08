@@ -171,6 +171,8 @@ public:
 	uint8_t attack_all_target{};
 	uint8_t attack_controler{};
 	uint64_t cardid{};
+	//the order card_set sorts by: the creation order, unless a following client set another (duel_order_cards)
+	uint64_t sortid{};
 	uint32_t fieldid{};
 	uint32_t fieldid_r{};	//real field id, updated when moving to new location
 	uint32_t activate_count_id{};	//updated when moving to new location or flipping
@@ -292,6 +294,9 @@ public:
 	void enable_field_effect(bool enabled);
 	int32_t add_effect(effect* peffect);
 	effect_indexer::iterator remove_effect(effect* peffect);
+	// The indexed effects in registration (id) order: ``indexer`` is keyed by pointer, so iterating it directly
+	// orders the messages a loop writes (client hints, counters) by allocation address.
+	std::vector<effect*> effects_by_id() const;
 	int32_t copy_effect(uint32_t code, uint32_t reset, int32_t count);
 	int32_t replace_effect(uint32_t code, uint32_t reset, int32_t count);
 	void reset(uint32_t id, uint32_t reset_type);

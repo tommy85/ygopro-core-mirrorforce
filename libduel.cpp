@@ -17,6 +17,9 @@ int32_t scriptlib::duel_enable_global_flag(lua_State *L) {
 	check_param_count(L, 1);
 	uint32_t flag = (uint32_t)lua_tointeger(L, 1);
 	duel* pduel = interpreter::get_duel_info(L);
+	if(!pduel->dormant_allows_registration())
+		return luaL_error(L, "Duel.EnableGlobalFlag while %d initializes: its code is outside the dormant table",
+		                  (int)pduel->initializing->data.code);
 	pduel->game_field->core.global_flag |= flag;
 	return 0;
 }
@@ -87,6 +90,9 @@ int32_t scriptlib::duel_register_effect(lua_State *L) {
 	if(playerid != 0 && playerid != 1)
 		return 0;
 	duel* pduel = peffect->pduel;
+	if(!pduel->dormant_allows_registration())
+		return luaL_error(L, "Duel.RegisterEffect while %d initializes: its code is outside the dormant table",
+		                  (int)pduel->initializing->data.code);
 	pduel->game_field->add_effect(peffect, playerid);
 	return 0;
 }
@@ -527,6 +533,7 @@ int32_t scriptlib::duel_sets(lua_State *L) {
 	} else if(check_param(L, PARAM_TYPE_GROUP, 2, TRUE)) {
 		pgroup = *(group**) lua_touserdata(L, 2);
 		pduel = pgroup->pduel;
+		pduel->lua->hold_group(pgroup);  // the PROCESSOR_SSET_G unit keeps it
 	} else
 		return luaL_error(L, "Parameter %d should be \"Card\" or \"Group\".", 2);
 	pduel->game_field->add_process(PROCESSOR_SSET_G, 0, pduel->game_field->core.reason_effect, pgroup, playerid, toplayer, confirm);
@@ -716,7 +723,7 @@ int32_t scriptlib::duel_sendto_extra(lua_State *L) {
 int32_t scriptlib::duel_get_operated_group(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group(pduel->game_field->core.operated_set);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_is_can_add_counter(lua_State *L) {
@@ -988,6 +995,7 @@ int32_t scriptlib::duel_confirm_decktop(lua_State *L) {
 		return 0;
 	uint32_t count = (uint32_t)lua_tointeger(L, 2);
 	duel* pduel = interpreter::get_duel_info(L);
+	pduel->tactical_audit.order(playerid);
 	if(count >= pduel->game_field->player[playerid].list_main.size())
 		count = (uint32_t)pduel->game_field->player[playerid].list_main.size();
 	else if(pduel->game_field->player[playerid].list_main.size() > count) {
@@ -1094,6 +1102,7 @@ int32_t scriptlib::duel_sort_decktop(lua_State *L) {
 	if (count < 1)
 		return 0;
 	duel* pduel = interpreter::get_duel_info(L);
+	pduel->tactical_audit.order(target_player);
 	pduel->game_field->add_process(PROCESSOR_SORT_DECK, 0, 0, 0, sort_player + (target_player << 16), count);
 	return lua_yield(L, 0);
 }
@@ -1608,6 +1617,23 @@ int32_t scriptlib::duel_shuffle_setcard(lua_State *L) {
 	for(int32_t i = ct - 1; i > 0; --i) {
 		int32_t s = pduel->get_next_integer(0, i);
 		std::swap(ms[i], ms[s]);
+	}
+	if(pduel->shuffle_plan.active()) {
+		// The original Fisher-Yates loop above always consumes exactly its
+		// original random words. Resolve distinguished entities at their
+		// physical source slots, not by indistinguishable same-code matching.
+		std::vector<uint32_t> positions(seq, seq + ct);
+		std::sort(positions.begin(), positions.end());
+		std::vector<card*> before(ct), after(ct);
+		for(uint32_t i = 0; i < ct; ++i) {
+			before[i] = loc == LOCATION_MZONE ? pduel->game_field->player[tp].list_mzone[positions[i]]
+			    : pduel->game_field->player[tp].list_szone[positions[i]];
+		}
+		for(uint32_t i = 0; i < ct; ++i)
+			after[std::lower_bound(positions.begin(), positions.end(), seq[i]) - positions.begin()] = ms[i];
+		if(pduel->shuffle_plan.consume(pduel, MSG_SHUFFLE_SET_CARD, tp, loc, positions, before, after, 3))
+			for(uint32_t i = 0; i < ct; ++i)
+				ms[i] = after[std::lower_bound(positions.begin(), positions.end(), seq[i]) - positions.begin()];
 	}
 	pduel->write_buffer8(MSG_SHUFFLE_SET_CARD);
 	pduel->write_buffer8(loc);
@@ -2184,7 +2210,7 @@ int32_t scriptlib::duel_get_linked_group(lua_State *L) {
 	card_set cset;
 	pduel->game_field->get_linked_cards(rplayer, s, o, &cset);
 	group* pgroup = pduel->new_group(cset);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_get_linked_group_count(lua_State *L) {
@@ -2217,6 +2243,7 @@ int32_t scriptlib::duel_get_field_card(lua_State *L) {
 	if(playerid != 0 && playerid != 1)
 		return 0;
 	duel* pduel = interpreter::get_duel_info(L);
+	pduel->tactical_audit.order(playerid, location);
 	card* pcard = pduel->game_field->get_field_card(playerid, location, sequence);
 	if(!pcard || pcard->get_status(STATUS_SUMMONING | STATUS_SPSUMMON_STEP))
 		return 0;
@@ -2372,7 +2399,7 @@ int32_t scriptlib::duel_get_targets_relate_to_chain(lua_State* L) {
 			}
 		}
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_is_phase(lua_State *L) {
@@ -2548,7 +2575,7 @@ int32_t scriptlib::duel_get_field_group(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->filter_field_card(playerid, location1, location2, pgroup);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -2576,11 +2603,12 @@ int32_t scriptlib::duel_get_decktop_group(lua_State *L) {
 	int32_t playerid = (int32_t)lua_tointeger(L, 1);
 	uint32_t count = (uint32_t)lua_tointeger(L, 2);
 	duel* pduel = interpreter::get_duel_info(L);
+	pduel->tactical_audit.order(playerid);
 	group* pgroup = pduel->new_group();
 	auto cit = pduel->game_field->player[playerid].list_main.rbegin();
 	for(uint32_t i = 0; i < count && cit != pduel->game_field->player[playerid].list_main.rend(); ++i, ++cit)
 		pgroup->container.insert(*cit);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -2597,7 +2625,7 @@ int32_t scriptlib::duel_get_extratop_group(lua_State *L) {
 	auto cit = pduel->game_field->player[playerid].list_extra.rbegin() + pduel->game_field->player[playerid].extra_p_count;
 	for(uint32_t i = 0; i < count && cit != pduel->game_field->player[playerid].list_extra.rend(); ++i, ++cit)
 		pgroup->container.insert(*cit);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -2622,7 +2650,7 @@ int32_t scriptlib::duel_get_matching_group(lua_State *L) {
 	uint32_t location2 = (uint32_t)lua_tointeger(L, 4);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->filter_matching_card(L, 1, (uint8_t)self, location1, location2, pgroup, pexception, pexgroup, extraargs);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -2739,7 +2767,7 @@ int32_t scriptlib::duel_select_matching_cards(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -2762,7 +2790,7 @@ int32_t scriptlib::duel_get_release_group(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_release_list(L, playerid, &pgroup->container, &pgroup->container, &pgroup->container, FALSE, hand, 0, 0, nullptr, nullptr, reason);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -2844,7 +2872,7 @@ int32_t scriptlib::duel_select_release_group(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -2911,7 +2939,7 @@ int32_t scriptlib::duel_select_release_group_ex(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -2927,7 +2955,7 @@ int32_t scriptlib::duel_get_tribute_group(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_summon_release_list(target, &(pgroup->container), &(pgroup->container), nullptr);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 /**
@@ -3021,7 +3049,7 @@ int32_t scriptlib::duel_select_tribute(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -3106,6 +3134,13 @@ int32_t scriptlib::duel_select_target(lua_State *L) {
 		return 0;
 	group* pgroup = pduel->new_group();
 	pduel->game_field->filter_matching_card(L, 2, (uint8_t)self, location1, location2, pgroup, pexception, pexgroup, extraargs, nullptr, 0, TRUE);
+	if(pgroup->container.size() < min) {
+		// fewer legal targets than the selection needs (a cost changed the field after the activation's check)
+		auto& core = pduel->game_field->core;
+		++core.target_shortfalls;
+		chain* link = pduel->game_field->get_chain(0);
+		core.target_shortfall_code = (link && link->triggering_effect) ? link->triggering_effect->get_handler()->data.code : 0;
+	}
 	pduel->game_field->core.select_cards.assign(pgroup->container.begin(), pgroup->container.end());
 	pduel->game_field->add_process(PROCESSOR_SELECT_CARD, 0, 0, 0, playerid, min + (max << 16));
 	return lua_yieldk(L, 0, (lua_KContext)pduel, [](lua_State *L, int32_t status, lua_KContext ctx) {
@@ -3136,7 +3171,7 @@ int32_t scriptlib::duel_select_target(lua_State *L) {
 					pduel->write_buffer32(pcard->get_info_location());
 				}
 			}
-			interpreter::group2value(L, pgroup);
+			interpreter::return_temporary_group(L, pgroup);
 		}
 		return 1;
 	});
@@ -3150,7 +3185,7 @@ int32_t scriptlib::duel_get_must_material(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_must_material_list(playerid, limit, &pgroup->container);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_check_must_material(lua_State *L) {
@@ -3179,7 +3214,11 @@ int32_t scriptlib::duel_check_must_material(lua_State *L) {
 	} else
 		pgroup = 0;
 	uint32_t limit = (uint32_t)lua_tointeger(L, 3);
-	lua_pushboolean(L, pduel->game_field->check_must_material(pgroup, playerid, limit));
+	int32_t result = pduel->game_field->check_must_material(pgroup, playerid, limit);
+	// The read-only copy is a temporary: release_script_group() frees only default groups, so delete it here.
+	if(pgroup)
+		pduel->delete_group(pgroup);
+	lua_pushboolean(L, result);
 	return 1;
 }
 int32_t scriptlib::duel_select_fusion_material(lua_State *L) {
@@ -3212,7 +3251,7 @@ int32_t scriptlib::duel_select_fusion_material(lua_State *L) {
 			card* cg = *(card**)lua_touserdata(L, 4);
 			pgroup->container.insert(cg);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -3250,7 +3289,7 @@ int32_t scriptlib::duel_get_synchro_material(lua_State *L) {
 			continue;
 		pgroup->container.insert(*cit);
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_select_synchro_material(lua_State *L) {
@@ -3286,6 +3325,7 @@ int32_t scriptlib::duel_select_synchro_material(lua_State *L) {
 				select_cards.insert(pm);
 		}
 		pduel->game_field->core.select_cards.assign(select_cards.begin(), select_cards.end());
+		pduel->lua->hold_group(mg);  // the PROCESSOR_SELECT_SYNCHRO unit keeps it
 		pduel->game_field->add_process(PROCESSOR_SELECT_SYNCHRO, 0, nullptr, nullptr, playerid, min + (max << 16), filter1, filter2, pcard, mg);
 	}
 	else {
@@ -3352,6 +3392,8 @@ int32_t scriptlib::duel_select_tuner_material(lua_State *L) {
 	pduel->game_field->returns.bvalue[1] = 0;
 	auto filter1 = interpreter::get_function_handle(L, 4);
 	auto filter2 = interpreter::get_function_handle(L, 5);
+	if(mg)
+		pduel->lua->hold_group(mg);  // the PROCESSOR_SELECT_SYNCHRO unit keeps it
 	pduel->game_field->add_process(PROCESSOR_SELECT_SYNCHRO, 1, nullptr, nullptr, playerid, min + (max << 16), filter1, filter2, pcard, mg);
 	return lua_yield(L, 0);
 }
@@ -3384,7 +3426,7 @@ int32_t scriptlib::duel_get_ritual_material(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_ritual_material(playerid, pduel->game_field->core.reason_effect, &pgroup->container);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_get_ritual_material_ex(lua_State *L) {
@@ -3395,7 +3437,7 @@ int32_t scriptlib::duel_get_ritual_material_ex(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_ritual_material(playerid, pduel->game_field->core.reason_effect, &pgroup->container, TRUE);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_release_ritual_material(lua_State *L) {
@@ -3418,8 +3460,8 @@ int32_t scriptlib::duel_get_fusion_material(lua_State *L) {
 	group* pgroupall = pduel->new_group();
 	group* pgroupbase = pduel->new_group();
 	pduel->game_field->get_fusion_material(playerid, &pgroupall->container, &pgroupbase->container, location);
-	interpreter::group2value(L, pgroupall);
-	interpreter::group2value(L, pgroupbase);
+	interpreter::return_temporary_group(L, pgroupall);
+	interpreter::return_temporary_group(L, pgroupbase);
 	return 2;
 }
 int32_t scriptlib::duel_is_summon_cancelable(lua_State *L) {
@@ -3448,7 +3490,7 @@ int32_t scriptlib::duel_grab_must_select_cards(lua_State *L) {
 	if(pduel->game_field->core.must_select_cards.size())
 		pgroup->container.insert(pduel->game_field->core.must_select_cards.begin(), pduel->game_field->core.must_select_cards.end());
 	pduel->game_field->core.must_select_cards.clear();
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_set_target_card(lua_State *L) {
@@ -3710,7 +3752,7 @@ int32_t scriptlib::duel_get_overlay_group(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
 	pduel->game_field->get_overlay_group(rplayer, s, o, &pgroup->container);
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::duel_get_overlay_count(lua_State *L) {
@@ -4695,6 +4737,9 @@ int32_t scriptlib::duel_add_custom_activity_counter(lua_State *L) {
 	int32_t activity_type = (int32_t)lua_tointeger(L, 2);
 	int32_t counter_filter = interpreter::get_function_handle(L, 3);
 	duel* pduel = interpreter::get_duel_info(L);
+	if(!pduel->dormant_allows_registration())
+		return luaL_error(L, "Duel.AddCustomActivityCounter while %d initializes: its code is outside the dormant table",
+		                  (int)pduel->initializing->data.code);
 	switch(activity_type) {
 		case ACTIVITY_SUMMON: {
 			pduel->game_field->core.summon_counter.emplace(counter_id, activity_map::mapped_type(counter_filter, 0));
@@ -4813,7 +4858,8 @@ int32_t scriptlib::duel_majestic_copy(lua_State *L) {
 	check_param(L, PARAM_TYPE_CARD, 2);
 	card* pcard = *(card**) lua_touserdata(L, 1);
 	card* copy_target = *(card**) lua_touserdata(L, 2);
-	for(auto& peffect: copy_target->initial_effect) {
+	// The clones take effect ids in the copied card's registration order, not in allocation order.
+	for(effect* peffect : effects_by_id(copy_target->initial_effect)) {
 		if (!(peffect->type & (EFFECT_TYPES_CHAIN_LINK & ~EFFECT_TYPE_ACTIVATE)))
 			continue;
 		if (peffect->type & EFFECT_TYPE_XMATERIAL)

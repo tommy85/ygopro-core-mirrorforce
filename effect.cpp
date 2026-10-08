@@ -399,6 +399,8 @@ int32_t effect::is_action_check(uint8_t playerid) {
 }
 // check functions: condition, cost(chk=0), target(chk=0)
 int32_t effect::is_activate_ready(effect* reason_effect, uint8_t playerid, const tevent& e, int32_t neglect_cond, int32_t neglect_cost, int32_t neglect_target) {
+	// A forced activation (duel::forced_activations) runs its script checks, for what they set, and passes them.
+	const bool forced = pduel->is_forced_activation(this);
 	if(!neglect_cond && condition) {
 		pduel->lua->add_param(reason_effect, PARAM_TYPE_EFFECT);
 		pduel->lua->add_param(playerid, PARAM_TYPE_INT);
@@ -408,7 +410,7 @@ int32_t effect::is_activate_ready(effect* reason_effect, uint8_t playerid, const
 		pduel->lua->add_param(e.reason_effect, PARAM_TYPE_EFFECT);
 		pduel->lua->add_param(e.reason, PARAM_TYPE_INT);
 		pduel->lua->add_param(e.reason_player, PARAM_TYPE_INT);
-		if(!pduel->lua->check_condition(condition, 8)) {
+		if(!pduel->lua->check_condition(condition, 8) && !forced) {
 			return FALSE;
 		}
 	}
@@ -424,7 +426,7 @@ int32_t effect::is_activate_ready(effect* reason_effect, uint8_t playerid, const
 			pduel->lua->add_param(e.reason, PARAM_TYPE_INT);
 			pduel->lua->add_param(e.reason_player, PARAM_TYPE_INT);
 			pduel->lua->add_param(0, PARAM_TYPE_INT);
-			if(!pduel->lua->check_condition(cost, 9)) {
+			if(!pduel->lua->check_condition(cost, 9) && !forced) {
 				reason_effect->cost_checked = FALSE;
 				return FALSE;
 			}
@@ -442,7 +444,7 @@ int32_t effect::is_activate_ready(effect* reason_effect, uint8_t playerid, const
 		pduel->lua->add_param(e.reason, PARAM_TYPE_INT);
 		pduel->lua->add_param(e.reason_player, PARAM_TYPE_INT);
 		pduel->lua->add_param(0, PARAM_TYPE_INT);
-		if(!pduel->lua->check_condition(target, 9)) {
+		if(!pduel->lua->check_condition(target, 9) && !forced) {
 			reason_effect->cost_checked = FALSE;
 			return FALSE;
 		}
@@ -473,7 +475,7 @@ int32_t effect::is_condition_check(uint8_t playerid, const tevent& e) {
 	pduel->lua->add_param(e.reason_effect , PARAM_TYPE_EFFECT);
 	pduel->lua->add_param(e.reason, PARAM_TYPE_INT);
 	pduel->lua->add_param(e.reason_player, PARAM_TYPE_INT);
-	if(!pduel->lua->check_condition(condition, 8)) {
+	if(!pduel->lua->check_condition(condition, 8) && !pduel->is_forced_activation(this)) {
 		pduel->game_field->restore_lp_cost();
 		pduel->game_field->core.reason_effect = oreason;
 		pduel->game_field->core.reason_player = op;

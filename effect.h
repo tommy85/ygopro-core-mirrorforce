@@ -63,6 +63,9 @@ public:
 	int32_t value{ 0 };
 	int32_t operation{ 0 };
 	uint8_t cost_checked{ FALSE };
+	// a function of the effect called Effect.IsCostChecked: it pays a cost in its target function
+	// (query_activation_flags)
+	uint8_t reads_cost_check{ FALSE };
 	effect_set required_handorset_effects;
 	LuaParamType object_type{ PARAM_TYPE_INT };
 

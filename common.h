@@ -45,6 +45,9 @@ inline bool check_playerid(int32_t playerid) {
 #define PROCESSOR_NONE			0
 #define PROCESSOR_WAITING		0x10000000
 #define PROCESSOR_END			0x20000000
+// Only an explicitly installed hypothetical shuffle plan can return this.
+// Its partial message buffer is diagnostic, never a successful replay batch.
+#define PROCESSOR_REPLAY_ERROR	0x40000000
 
 #define MASTER_RULE3		3	//Master Rule 3 (2014)
 #define NEW_MASTER_RULE		4	//New Master Rule (2017)

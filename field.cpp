@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <functional>
 
-int32_t field::field_used_count[32] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5};
+const int32_t field::field_used_count[32] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5};
 
 bool chain::chain_operation_sort(const chain& c1, const chain& c2) {
 	auto e1 = c1.triggering_effect;
@@ -944,6 +944,54 @@ void field::get_cards_in_zone(card_set* cset, uint32_t zone, int32_t playerid, i
 		icheck <<= 1;
 	}
 }
+// Debug.ForceShuffle's order replaces the random one after the shuffle drew its random numbers, so the
+// duel's later random draws are those of the unforced shuffle. A hand or extra deck order names every
+// card by sequence; a deck order names the top cards, the first the top. An order that does not fit the
+// cards leaves the random one; either way it is used once.
+void field::apply_forced_shuffle(uint8_t playerid, uint8_t location, card_vector& svector, int32_t count) {
+	std::vector<uint32_t>& pending = core.forced_shuffle[playerid][location == LOCATION_HAND ? 0 : location == LOCATION_DECK ? 1 : 2];
+	if(pending.empty())
+		return;
+	std::vector<uint32_t> codes;
+	codes.swap(pending);
+	if(location == LOCATION_DECK) {
+		if((int32_t)codes.size() > count)
+			return;
+		card_vector result(svector.begin(), svector.begin() + count);
+		for(size_t depth = 0; depth < codes.size(); ++depth) {
+			int32_t place = count - 1 - (int32_t)depth;
+			int32_t found = -1;
+			for(int32_t i = place; i >= 0; --i)
+				if(result[i]->data.code == codes[depth]) {
+					found = i;
+					break;
+				}
+			if(found < 0)
+				return;
+			std::swap(result[found], result[place]);
+		}
+		std::copy(result.begin(), result.end(), svector.begin());
+		return;
+	}
+	if((int32_t)codes.size() != count)
+		return;
+	card_vector result;
+	result.reserve(count);
+	std::vector<bool> used(count, false);
+	for(uint32_t code : codes) {
+		int32_t found = -1;
+		for(int32_t i = 0; i < count; ++i)
+			if(!used[i] && svector[i]->data.code == code) {
+				found = i;
+				break;
+			}
+		if(found < 0)
+			return;
+		used[found] = true;
+		result.push_back(svector[found]);
+	}
+	std::copy(result.begin(), result.end(), svector.begin());
+}
 void field::shuffle(uint8_t playerid, uint8_t location) {
 	if(!(location & (LOCATION_HAND | LOCATION_DECK | LOCATION_EXTRA)))
 		return;
@@ -960,12 +1008,36 @@ void field::shuffle(uint8_t playerid, uint8_t location) {
 			return;
 		}
 	}
+	std::vector<card*> plan_before;
+	std::vector<uint32_t> plan_sequences;
+	const bool planned = pduel->shuffle_plan.active();
+	const int32_t plan_count = (int32_t)svector.size()
+	    - (location == LOCATION_EXTRA ? (int32_t)player[playerid].extra_p_count : 0);
+	if(planned) {
+		plan_before.assign(svector.begin(), svector.begin() + plan_count);
+		for(int32_t i = 0; i < plan_count; ++i)
+			plan_sequences.push_back((uint32_t)i);
+	}
 	if(location == LOCATION_HAND || !(core.duel_options & DUEL_PSEUDO_SHUFFLE)) {
 		int32_t s = (int32_t)svector.size();
 		if(location == LOCATION_EXTRA)
 			s = s - (int32_t)player[playerid].extra_p_count;
 		if(s > 1) {
+			pduel->tactical_audit.random(location == LOCATION_DECK
+			    && pduel->tactical_audit.order_player == playerid);
 			pduel->random.shuffle_vector(svector, 0, s, pduel->rng_version);
+			apply_forced_shuffle(playerid, location, svector, s);
+			reset_sequence(playerid, location);
+		}
+	}
+	if(planned) {
+		std::vector<card*> plan_after(svector.begin(), svector.begin() + plan_count);
+		const uint32_t message = location == LOCATION_HAND ? MSG_SHUFFLE_HAND
+		    : location == LOCATION_DECK ? MSG_SHUFFLE_DECK : MSG_SHUFFLE_EXTRA;
+		const bool random = plan_count > 1 && (location == LOCATION_HAND || !(core.duel_options & DUEL_PSEUDO_SHUFFLE));
+		if(pduel->shuffle_plan.consume(pduel, message, playerid, location, plan_sequences,
+		                              plan_before, plan_after, random ? 1 : 2)) {
+			std::copy(plan_after.begin(), plan_after.end(), svector.begin());
 			reset_sequence(playerid, location);
 		}
 	}
@@ -978,8 +1050,7 @@ void field::shuffle(uint8_t playerid, uint8_t location) {
 		if(location == LOCATION_HAND) {
 			core.shuffle_hand_check[playerid] = FALSE;
 			for(auto& pcard : svector) {
-				for(auto& i : pcard->indexer) {
-					effect* peffect = i.first;
+				for(effect* peffect : pcard->effects_by_id()) {
 					if(peffect->is_flag(EFFECT_FLAG_CLIENT_HINT) && !peffect->is_flag(EFFECT_FLAG_PLAYER_TARGET)) {
 						pduel->write_buffer8(MSG_CARD_HINT);
 						pduel->write_buffer32(pcard->get_info_location());
@@ -1317,24 +1388,33 @@ void field::release_oath_relation(effect* reason_effect) {
 		if(oeit.second == reason_effect)
 			oeit.second = 0;
 }
+// The effects of a pointer-keyed collection in registration (id) order, so the messages written while walking
+// it (client hints, counters, forced chains) do not follow allocation addresses.
+std::vector<effect*> effects_by_id(const effect_collection& collection) {
+	std::vector<effect*> result(collection.begin(), collection.end());
+	std::sort(result.begin(), result.end(), effect_sort_id);
+	return result;
+}
 void field::reset_phase(uint32_t phase) {
-	for(auto eit = effects.pheff.begin(); eit != effects.pheff.end();) {
-		auto rm = eit++;
-		if((*rm)->reset(phase, RESET_PHASE)) {
-			if((*rm)->is_flag(EFFECT_FLAG_FIELD_ONLY))
-				remove_effect(*rm);
+	for(effect* peffect : effects_by_id(effects.pheff)) {
+		if(!effects.pheff.count(peffect))
+			continue;
+		if(peffect->reset(phase, RESET_PHASE)) {
+			if(peffect->is_flag(EFFECT_FLAG_FIELD_ONLY))
+				remove_effect(peffect);
 			else
-				(*rm)->handler->remove_effect((*rm));
+				peffect->handler->remove_effect(peffect);
 		}
 	}
 }
 void field::reset_chain() {
-	for(auto eit = effects.cheff.begin(); eit != effects.cheff.end();) {
-		auto rm = eit++;
-		if((*rm)->is_flag(EFFECT_FLAG_FIELD_ONLY))
-			remove_effect(*rm);
+	for(effect* peffect : effects_by_id(effects.cheff)) {
+		if(!effects.cheff.count(peffect))
+			continue;
+		if(peffect->is_flag(EFFECT_FLAG_FIELD_ONLY))
+			remove_effect(peffect);
 		else
-			(*rm)->handler->remove_effect((*rm));
+			peffect->handler->remove_effect(peffect);
 	}
 }
 void field::add_effect_code(uint32_t code, int32_t playerid) {
@@ -1535,6 +1615,10 @@ int32_t field::filter_matching_card(lua_State* L, int32_t findex, uint8_t self, 
 			}
 		}
 		if(location & LOCATION_DECK) {
+			// Returning the first match (unlike a complete set or an existence
+			// boolean with pure filters) consumes the unknown vector order.
+			if(pret)
+				pduel->tactical_audit.order(self);
 			for(auto cit = player[self].list_main.rbegin(); cit != player[self].list_main.rend(); ++cit) {
 				if(*cit != pexception && !(pexgroup && pexgroup->has_card(*cit))
 				        && pduel->lua->check_filter(L, *cit, findex, extraargs)
@@ -2120,14 +2204,27 @@ void field::erase_grant_effect(effect* peffect) {
 	auto eit = effects.grant_effect.find(peffect);
 	if (eit == effects.grant_effect.end())
 		return;
-	for(auto& it : eit->second)
+	std::vector<std::pair<card*, effect*>> gained(eit->second.begin(), eit->second.end());
+	// Removal writes client hints; remove in registration order, not in allocation order.
+	std::sort(gained.begin(), gained.end(), [](const std::pair<card*, effect*>& a, const std::pair<card*, effect*>& b) {
+		return effect_sort_id(a.second, b.second);
+	});
+	for(auto& it : gained)
 		it.first->remove_effect(it.second);
 	effects.grant_effect.erase(eit);
 }
 int32_t field::adjust_grant_effect() {
 	int32_t adjusted = FALSE;
-	for(auto& eit : effects.grant_effect) {
-		effect* peffect = eit.first;
+	// Each grant clones effects that take new ids; walk the grants in effect-id order.
+	std::vector<effect*> grants;
+	for(auto& eit : effects.grant_effect)
+		grants.push_back(eit.first);
+	std::sort(grants.begin(), grants.end(), effect_sort_id);
+	for(effect* peffect : grants) {
+		auto found = effects.grant_effect.find(peffect);
+		if(found == effects.grant_effect.end())
+			continue;
+		auto& eit = *found;
 		if (peffect->object_type != PARAM_TYPE_EFFECT)
 			continue;
 		effect* geffect = (effect*)peffect->get_label_object();
@@ -3107,6 +3204,7 @@ int32_t field::is_player_can_discard_deck(uint8_t playerid, int32_t count) {
 	return !is_player_affected_by_effect(playerid, EFFECT_CANNOT_DISCARD_DECK);
 }
 int32_t field::is_player_can_discard_deck_as_cost(uint8_t playerid, int32_t count) {
+	pduel->tactical_audit.order(playerid);
 	if(count < 0 || (int32_t)player[playerid].list_main.size() < count)
 		return FALSE;
 	if(is_player_affected_by_effect(playerid, EFFECT_CANNOT_DISCARD_DECK))

@@ -14,7 +14,7 @@
 int32_t scriptlib::group_new(lua_State *L) {
 	duel* pduel = interpreter::get_duel_info(L);
 	group* pgroup = pduel->new_group();
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::group_clone(lua_State *L) {
@@ -23,7 +23,7 @@ int32_t scriptlib::group_clone(lua_State *L) {
 	group* pgroup = *(group**) lua_touserdata(L, 1);
 	duel* pduel = pgroup->pduel;
 	group* newgroup = pduel->new_group(pgroup->container);
-	interpreter::group2value(L, newgroup);
+	interpreter::return_temporary_group(L, newgroup);
 	return 1;
 }
 int32_t scriptlib::group_from_cards(lua_State *L) {
@@ -36,7 +36,7 @@ int32_t scriptlib::group_from_cards(lua_State *L) {
 			pgroup->container.insert(pcard);
 		}
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::group_delete(lua_State *L) {
@@ -58,6 +58,7 @@ int32_t scriptlib::group_keep_alive(lua_State *L) {
 	group* pgroup = *(group**) lua_touserdata(L, 1);
 	if(pgroup->is_readonly == GTYPE_READ_ONLY)
 		return 0;
+	pduel->lua->hold_group(pgroup);
 	pgroup->is_readonly = GTYPE_KEEP_ALIVE;
 	pduel->sgroups.erase(pgroup);
 	return 0;
@@ -155,7 +156,7 @@ int32_t scriptlib::group_filter(lua_State *L) {
 			new_group->container.insert(pcard);
 		}
 	}
-	interpreter::group2value(L, new_group);
+	interpreter::return_temporary_group(L, new_group);
 	return 1;
 }
 int32_t scriptlib::group_filter_count(lua_State *L) {
@@ -217,7 +218,7 @@ int32_t scriptlib::group_filter_select(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -253,7 +254,7 @@ int32_t scriptlib::group_select(lua_State *L) {
 			card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 			pgroup->container.insert(pcard);
 		}
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -337,7 +338,7 @@ int32_t scriptlib::group_random_select(lua_State *L) {
 	if (count > (int32_t)pgroup->container.size())
 		count = (int32_t)pgroup->container.size();
 	if(count == 0) {
-		interpreter::group2value(L, newgroup);
+		interpreter::return_temporary_group(L, newgroup);
 		return 1;
 	}
 	if(count == pgroup->container.size())
@@ -351,13 +352,31 @@ int32_t scriptlib::group_random_select(lua_State *L) {
 		}
 		newgroup->container.insert(cv.begin(), cv.begin() + count);
 	}
+	// A following client forces the selection the public stream showed, naming each card by its code when its
+	// identity is public (copies of one card are not told apart) and by its location otherwise.
+	if(const duel::forced_select* forced = pduel->next_forced_select()) {
+		card_set chosen;
+		for(uint32_t i = 0; i < forced->count && i < 8; ++i)
+			for(auto& pcard : pgroup->container) {
+				const bool named = forced->codes[i] ? pcard->data.code == forced->codes[i]
+				    : (pcard->get_info_location() & 0x00ffffff) == (forced->locations[i] & 0x00ffffff);
+				if(named && !chosen.count(pcard)) {
+					chosen.insert(pcard);
+					break;
+				}
+			}
+		if((int32_t)forced->count == count && (int32_t)chosen.size() == count)
+			newgroup->container = chosen;
+		else
+			++pduel->forced_random_misses;
+	}
 	pduel->write_buffer8(MSG_RANDOM_SELECTED);
 	pduel->write_buffer8(playerid);
 	pduel->write_buffer8(count);
 	for(auto& pcard : newgroup->container) {
 		pduel->write_buffer32(pcard->get_info_location());
 	}
-	interpreter::group2value(L, newgroup);
+	interpreter::return_temporary_group(L, newgroup);
 	return 1;
 }
 int32_t scriptlib::group_cancelable_select(lua_State *L) {
@@ -395,7 +414,7 @@ int32_t scriptlib::group_cancelable_select(lua_State *L) {
 				card* pcard = pduel->game_field->core.select_cards[pduel->game_field->returns.bvalue[i + 1]];
 				pgroup->container.insert(pcard);
 			}
-			interpreter::group2value(L, pgroup);
+			interpreter::return_temporary_group(L, pgroup);
 		}
 		return 1;
 	});
@@ -495,7 +514,7 @@ int32_t scriptlib::group_select_with_sum_equal(lua_State *L) {
 	if(!field::check_with_sum_limit_m(cv, acc, 0, min, max, 0xffff, mcount)) {
 		pduel->game_field->core.must_select_cards.clear();
 		group* empty_group = pduel->new_group();
-		interpreter::group2value(L, empty_group);
+		interpreter::return_temporary_group(L, empty_group);
 		return 1;
 	}
 	pduel->game_field->add_process(PROCESSOR_SELECT_SUM, 0, 0, 0, acc, playerid, min, max);
@@ -508,7 +527,7 @@ int32_t scriptlib::group_select_with_sum_equal(lua_State *L) {
 			pgroup->container.insert(pcard);
 		}
 		pduel->game_field->core.must_select_cards.clear();
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -558,7 +577,7 @@ int32_t scriptlib::group_select_with_sum_greater(lua_State *L) {
 	if(!field::check_with_sum_greater_limit_m(cv, acc, 0, 0xffff, mcount)) {
 		pduel->game_field->core.must_select_cards.clear();
 		group* empty_group = pduel->new_group();
-		interpreter::group2value(L, empty_group);
+		interpreter::return_temporary_group(L, empty_group);
 		return 1;
 	}
 	pduel->game_field->add_process(PROCESSOR_SELECT_SUM, 0, 0, 0, acc, playerid);
@@ -571,7 +590,7 @@ int32_t scriptlib::group_select_with_sum_greater(lua_State *L) {
 			pgroup->container.insert(pcard);
 		}
 		pduel->game_field->core.must_select_cards.clear();
-		interpreter::group2value(L, pgroup);
+		interpreter::return_temporary_group(L, pgroup);
 		return 1;
 	});
 }
@@ -600,7 +619,7 @@ int32_t scriptlib::group_get_min_group(lua_State *L) {
 			min = op;
 		}
 	}
-	interpreter::group2value(L, newgroup);
+	interpreter::return_temporary_group(L, newgroup);
 	lua_pushinteger(L, min);
 	return 2;
 }
@@ -629,7 +648,7 @@ int32_t scriptlib::group_get_max_group(lua_State *L) {
 			max = op;
 		}
 	}
-	interpreter::group2value(L, newgroup);
+	interpreter::return_temporary_group(L, newgroup);
 	lua_pushinteger(L, max);
 	return 2;
 }
@@ -802,7 +821,7 @@ int32_t scriptlib::group_meta_add(lua_State* L) {
 		for(auto cit = cgroup->container.begin(); cit != cgroup->container.end(); ++cit)
 			pgroup->container.insert(*cit);
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::group_meta_sub(lua_State* L) {
@@ -829,7 +848,7 @@ int32_t scriptlib::group_meta_sub(lua_State* L) {
 		for(auto cit = cgroup->container.begin(); cit != cgroup->container.end(); ++cit)
 			pgroup->container.erase(*cit);
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::group_meta_band(lua_State* L) {
@@ -858,7 +877,7 @@ int32_t scriptlib::group_meta_band(lua_State* L) {
 			if(check_set.find(*cit) != check_set.end())
 				pgroup->container.insert(*cit);
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 int32_t scriptlib::group_meta_bxor(lua_State* L) {
@@ -892,7 +911,7 @@ int32_t scriptlib::group_meta_bxor(lua_State* L) {
 				pgroup->container.insert(*cit);
 		}
 	}
-	interpreter::group2value(L, pgroup);
+	interpreter::return_temporary_group(L, pgroup);
 	return 1;
 }
 
@@ -937,8 +956,33 @@ static const struct luaL_Reg grouplib[] = {
 	{ "__sub", scriptlib::group_meta_sub },
 	{ "__band", scriptlib::group_meta_band },
 	{ "__bxor", scriptlib::group_meta_bxor },
+	{ "__gc", scriptlib::group_gc },
 	{ nullptr, nullptr }
 };
+// Group.__gc, the finalizer of every group userdata. It marks a weak script temporary the collector found
+// unreachable (the collector clears its weak-table slot before finalizing it) for deletion at the next deterministic
+// point. A strong group's userdata is collected only after the group was deleted and its pointer cleared, and a
+// script calling Group.__gc itself on a live group finds it still in the weak table: neither changes anything.
+int32_t scriptlib::group_gc(lua_State *L) {
+	if(!lua_isuserdata(L, 1) || !lua_getmetatable(L, 1))
+		return 0;
+	luaL_checkstack(L, 2, nullptr);
+	lua_getglobal(L, "Group");
+	const bool is_group = lua_rawequal(L, -1, -2);
+	lua_pop(L, 2);
+	if(!is_group)
+		return 0;
+	group* pgroup = *(group**) lua_touserdata(L, 1);
+	if(!pgroup || !pgroup->weak)
+		return 0;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, pgroup->pduel->lua->weak_groups);
+	lua_rawgeti(L, -1, pgroup->ref_handle);
+	const bool live = !lua_isnil(L, -1);
+	lua_pop(L, 2);
+	if(!live)
+		pgroup->pduel->mark_collected(pgroup);
+	return 0;
+}
 void scriptlib::open_grouplib(lua_State *L) {
 	luaL_newlib(L, grouplib);
 	lua_pushstring(L, "__index");

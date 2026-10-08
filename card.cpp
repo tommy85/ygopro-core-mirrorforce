@@ -16,7 +16,7 @@
 #include <algorithm>
 
 bool card_sort::operator()(card* const& c1, card* const& c2) const {
-	return c1->cardid < c2->cardid;
+	return c1->sortid < c2->sortid;
 }
 bool card_state::is_location(uint32_t loc) const {
 	if((loc & LOCATION_FZONE) && location == LOCATION_SZONE && sequence == 5)
@@ -157,6 +157,8 @@ inline void update_cache(uint32_t tdata, uint32_t& cache, byte*& p, uint32_t& qu
 		query_flag &= ~flag;
 }
 int32_t card::get_infos(byte* buf, uint32_t query_flag, int32_t use_cache) {
+	if(query_flag & ~QUERY_POSITION)
+		pduel->tactical_audit.card(cardid, mf_tactical_audit::CARD_IDENTITY);
 	byte* p = buf;
 	std::pair<int32_t, int32_t> atk_def(-10, -10);
 	std::pair<int32_t, int32_t> base_atk_def(-10, -10);
@@ -409,10 +411,12 @@ uint32_t card::get_public_info_location() {
 }
 // get the printed code on card
 uint32_t card::get_original_code() const {
+	pduel->tactical_audit.card(cardid, mf_tactical_audit::CARD_IDENTITY);
 	return data.get_original_code();
 }
 // get the original code in duel (can be different from printed code)
 std::tuple<uint32_t, uint32_t> card::get_original_code_rule() const {
+	pduel->tactical_audit.card(cardid, mf_tactical_audit::CARD_IDENTITY);
 	auto it = second_code.find(data.get_original_code());
 	if (it != second_code.end()) {
 		return std::make_tuple(data.get_original_code(), it->second);
@@ -422,6 +426,7 @@ std::tuple<uint32_t, uint32_t> card::get_original_code_rule() const {
 // return: the current card name
 // for double-name cards, it returns printed name
 uint32_t card::get_code() {
+	pduel->tactical_audit.card(cardid, mf_tactical_audit::CARD_IDENTITY);
 	if(assume_type == ASSUME_CODE)
 		return assume_value;
 	if(temp.code != UINT32_MAX) // prevent recursion, return the former value
@@ -557,6 +562,7 @@ int32_t card::is_special_summon_set_card(uint32_t set_code) {
 	return FALSE;
 }
 uint32_t card::get_type() {
+	pduel->tactical_audit.card(cardid, mf_tactical_audit::CARD_IDENTITY);
 	if(assume_type == ASSUME_TYPE)
 		return assume_value;
 	if(!(current.location & (LOCATION_ONFIELD | LOCATION_HAND | LOCATION_GRAVE)))
@@ -1914,6 +1920,14 @@ int32_t card::add_effect(effect* peffect) {
 	}
 	return peffect->id;
 }
+std::vector<effect*> card::effects_by_id() const {
+	std::vector<effect*> result;
+	result.reserve(indexer.size());
+	for(auto& entry : indexer)
+		result.push_back(entry.first);
+	std::sort(result.begin(), result.end(), effect_sort_id);
+	return result;
+}
 effect_indexer::iterator card::remove_effect(effect* peffect) {
 	auto index = indexer.find(peffect);
 	if (index == indexer.end())
@@ -2040,12 +2054,9 @@ int32_t card::replace_effect(uint32_t code, uint32_t reset, int32_t count) {
 		reset = RESETS_STANDARD;
 	if(is_status(STATUS_EFFECT_REPLACED))
 		set_status(STATUS_EFFECT_REPLACED, FALSE);
-	for(auto it = indexer.begin(); it != indexer.end();) {
-		effect* const& peffect = it->first;
-		if (peffect->is_flag(EFFECT_FLAG_INITIAL))
-			it = remove_effect(peffect);
-		else
-			++it;
+	for(effect* peffect : effects_by_id()) {
+		if (indexer.count(peffect) && peffect->is_flag(EFFECT_FLAG_INITIAL))
+			remove_effect(peffect);
 	}
 	auto cr = pduel->game_field->core.copy_reset;
 	auto crc = pduel->game_field->core.copy_reset_count;
@@ -2149,15 +2160,12 @@ void card::reset(uint32_t id, uint32_t reset_type) {
 		effect_target_cards.clear();
 	}
 	bool reload = false;
-	for (auto it = indexer.begin(); it != indexer.end();) {
-		effect* const& peffect = it->first;
-		if (peffect->reset(id, reset_type)) {
+	for (effect* peffect : effects_by_id()) {
+		if (indexer.count(peffect) && peffect->reset(id, reset_type)) {
 			if (is_status(STATUS_EFFECT_REPLACED) && peffect->is_flag(EFFECT_FLAG_INITIAL) && peffect->copy_id)
 				reload = true;
-			it = remove_effect(peffect);
+			remove_effect(peffect);
 		}
-		else
-			++it;
 	}
 	if (reload) {
 		set_status(STATUS_EFFECT_REPLACED, FALSE);
@@ -2675,8 +2683,8 @@ void card::filter_immune_effect() {
 // 3. Insert overlay_target of peffect into it.
 // 4. Insert continuous target of this into it.
 void card::filter_disable_related_cards() {
-	for (auto& it : indexer) {
-		effect* const& peffect = it.first;
+	// The check list order is the order cards are re-checked (and their resets write hints).
+	for (effect* peffect : effects_by_id()) {
 		if (peffect->is_disable_related()) {
 			if (peffect->type & EFFECT_TYPE_FIELD)
 				pduel->game_field->update_disable_check_list(peffect);

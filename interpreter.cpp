@@ -13,10 +13,20 @@
 #include "scriptlib.h"
 #include "ocgapi.h"
 #include "interpreter.h"
+#include "mfsnap.h"
+#include <cstdlib>
 
 interpreter::interpreter(duel* pd, bool enable_unsafe_libraries)
 	: coroutines(256), pduel(pd), enable_unsafe_feature(enable_unsafe_libraries) {
-	lua_state = luaL_newstate();
+	/* the whole Lua heap lives in the duel's arena: snapshots then cover
+	 * every coroutine and GC structure by construction, with nothing to
+	 * serialize.  Panic mirrors luaL_newstate's abort-on-error contract. */
+	lua_state = lua_newstate(mfsnap_lua_alloc, mfsnap_current());
+	lua_atpanic(lua_state, [](lua_State* L) -> int {
+		(void)L;
+		std::abort();
+		return 0;
+	});
 	current_state = lua_state;
 	std::memcpy(lua_getextraspace(lua_state), &pd, LUA_EXTRASPACE); //set_duel_info
 	//Initial
@@ -44,6 +54,16 @@ interpreter::interpreter(duel* pd, bool enable_unsafe_libraries)
 		nil_out("dofile");
 		nil_out("loadfile");
 	}
+	// the weak-valued table that anchors script temporaries (see return_temporary_group)
+	lua_createtable(lua_state, 0, 0);
+	lua_createtable(lua_state, 0, 1);
+	lua_pushliteral(lua_state, "v");
+	lua_setfield(lua_state, -2, "__mode");
+	lua_setmetatable(lua_state, -2);
+	weak_groups = luaL_ref(lua_state, LUA_REGISTRYINDEX);
+#ifdef MF_GROUP_AUDIT
+	mf_group_audit_gc_pressure(lua_state);
+#endif
 	//open all libs
 	scriptlib::open_cardlib(lua_state);
 	scriptlib::open_effectlib(lua_state);
@@ -77,11 +97,29 @@ void interpreter::register_card(card *pcard) {
 	//Initial
 	if(is_load_script(pcard->data)) {
 		pcard->set_status(STATUS_INITIALIZING, TRUE);
+		card* outer = pduel->initializing;
+		pduel->initializing = pcard;
 		add_param(pcard, PARAM_TYPE_CARD);
 		call_card_function(pcard, "initial_effect", 1, 0);
+		pduel->initializing = outer;
 		pcard->set_status(STATUS_INITIALIZING, FALSE);
 	}
 	pcard->cardid = pduel->game_field->infos.card_id++;
+	pcard->sortid = pcard->cardid;
+}
+bool interpreter::rebind_card(card *pcard) {
+	if(!pcard || !pcard->ref_handle)
+		return false;
+	const int top = lua_gettop(current_state);
+	luaL_checkstack(current_state, 2, nullptr);
+	lua_rawgeti(current_state, LUA_REGISTRYINDEX, pcard->ref_handle);
+	if(!load_card_script(pcard->data.get_original_code())) {
+		lua_settop(current_state, top);
+		return false;
+	}
+	lua_setmetatable(current_state, -2);
+	lua_settop(current_state, top);
+	return true;
 }
 void interpreter::unregister_card(card *pcard) {
 	if (!pcard)
@@ -126,6 +164,8 @@ void interpreter::register_group(group *pgroup) {
 	luaL_checkstack(lua_state, 3, nullptr);
 	group ** ppgroup = (group**) lua_newuserdata(lua_state, sizeof(group*));
 	*ppgroup = pgroup;
+	pgroup->ud = ppgroup;
+	pgroup->weak = false;
 	pgroup->ref_handle = luaL_ref(lua_state, LUA_REGISTRYINDEX);
 	//set metatable of pointer to base script
 	lua_rawgeti(lua_state, LUA_REGISTRYINDEX, pgroup->ref_handle);
@@ -133,11 +173,89 @@ void interpreter::register_group(group *pgroup) {
 	lua_setmetatable(lua_state, -2);
 	lua_pop(lua_state, 1);
 }
-void interpreter::unregister_group(group *pgroup) {
+// `released_slots` collects a weak group's slot instead of freeing it (release_script_group frees them in slot
+// order, not in the address order it walks sgroups in).
+void interpreter::unregister_group(group *pgroup, std::vector<int32_t>* released_slots) {
 	if (!pgroup)
 		return;
-	luaL_unref(lua_state, LUA_REGISTRYINDEX, pgroup->ref_handle);
+	if(pgroup->ud)
+		*pgroup->ud = nullptr;
+	if(pgroup->weak) {
+		clear_weak_slot(pgroup->ref_handle);
+		if(released_slots)
+			released_slots->push_back(pgroup->ref_handle);
+		else
+			weak_group_free.push_back(pgroup->ref_handle);
+	} else
+		luaL_unref(lua_state, LUA_REGISTRYINDEX, pgroup->ref_handle);
 	pgroup->ref_handle = 0;
+	pgroup->weak = false;
+	pgroup->ud = nullptr;
+}
+// Hand a group a library function just created to Lua as its result, and let Lua's collector free it once no Lua
+// value refers to it. The caller keeps no pointer to it, and no C++ structure holds it: a group a structure keeps
+// is held first (hold_group). The group stays strong through every callback its function made while filling it,
+// so it only turns weak here, on the Lua stack. Only a script temporary turns weak: a default-type group of the
+// current script call (sgroups), which the outermost return would otherwise delete. The release at that return
+// still deletes whatever is left, exactly as before.
+void interpreter::return_temporary_group(lua_State* L, group* pgroup) {
+	group2value(L, pgroup);
+	interpreter* lua = pgroup->pduel->lua;
+	if(pgroup->weak || pgroup->is_readonly != GTYPE_DEFAULT || !pgroup->pduel->sgroups.count(pgroup))
+		return;
+	int32_t slot;
+	if(lua->weak_group_free.empty()) {
+		slot = lua->weak_group_next++;
+	} else {
+		slot = lua->weak_group_free.back();
+		lua->weak_group_free.pop_back();
+	}
+	luaL_checkstack(L, 2, nullptr);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, lua->weak_groups);
+	lua_pushvalue(L, -2);
+	lua_rawseti(L, -2, slot);
+	lua_pop(L, 1);
+	luaL_unref(L, LUA_REGISTRYINDEX, pgroup->ref_handle);
+	pgroup->ref_handle = slot;
+	pgroup->weak = true;
+	// Lua's collector paces itself by the Lua heap, where a group is a small userdata; its C++ object, card set and
+	// bookkeeping live outside, and it cannot see them. Count that side (an estimate from counts and fixed sizes:
+	// the object with its duel-set entries, one set node per card) and, every WEAK_GROUP_COLLECT_BYTES of it, run a
+	// full collection and delete what it found unreachable. The point depends only on the calls, and a full
+	// collection finds the same set in every process, so group lifetimes do too. This group is on the Lua stack.
+	lua->weak_group_bytes += (uint32_t)(sizeof(group) + 96 + 64 * pgroup->container.size());
+	if(lua->weak_group_bytes >= WEAK_GROUP_COLLECT_BYTES) {
+		lua->weak_group_bytes = 0;
+		lua_gc(L, LUA_GCCOLLECT, 0);
+		pgroup->pduel->free_collected_groups();
+#ifdef MF_GROUP_AUDIT
+		++pgroup->pduel->group_full_collections;
+#endif
+	}
+}
+// A C++ structure is about to keep this group beyond the current library call: make it strong again. A held
+// default-type group is still deleted by the outermost return, as before; a kept-alive one lives on.
+void interpreter::hold_group(group* pgroup) {
+	if(!pgroup->weak)
+		return;
+	luaL_checkstack(lua_state, 2, nullptr);
+	lua_rawgeti(lua_state, LUA_REGISTRYINDEX, weak_groups);
+	lua_rawgeti(lua_state, -1, pgroup->ref_handle);
+	if(lua_isnil(lua_state, -1))
+		mf_core_refusal("weak_group_invariant", "hold_group: a weak group C++ still names was already collected");
+	const int32_t ref = luaL_ref(lua_state, LUA_REGISTRYINDEX);
+	lua_pop(lua_state, 1);
+	clear_weak_slot(pgroup->ref_handle);
+	weak_group_free.push_back(pgroup->ref_handle);
+	pgroup->ref_handle = ref;
+	pgroup->weak = false;
+}
+void interpreter::clear_weak_slot(int32_t slot) {
+	luaL_checkstack(lua_state, 2, nullptr);
+	lua_rawgeti(lua_state, LUA_REGISTRYINDEX, weak_groups);
+	lua_pushnil(lua_state);
+	lua_rawseti(lua_state, -2, slot);
+	lua_pop(lua_state, 1);
 }
 int32_t interpreter::load_script(const char* script_name) {
 	int len = 0;
@@ -247,10 +365,7 @@ void interpreter::push_param(lua_State* L, bool is_coroutine) {
 			break;
 		}
 		case PARAM_TYPE_GROUP: {
-			if (it.first.ptr)
-				lua_rawgeti(L, LUA_REGISTRYINDEX, ((group*)it.first.ptr)->ref_handle);
-			else
-				lua_pushnil(L);
+			group2value(L, (group*)it.first.ptr);
 			break;
 		}
 		case PARAM_TYPE_FUNCTION: {
@@ -430,6 +545,8 @@ int32_t interpreter::check_condition(int32_t f, uint32_t param_count) {
 }
 int32_t interpreter::check_filter(lua_State* L, card* pcard, int32_t findex, int32_t extraargs) {
 	if (!findex || lua_isnil(L, findex))
+		return TRUE;
+	if (pduel->blank_passes_filter(pcard))
 		return TRUE;
 	++no_action;
 	++call_depth;
@@ -665,11 +782,20 @@ void interpreter::card2value(lua_State* L, card* pcard) {
 		lua_rawgeti(L, LUA_REGISTRYINDEX, pcard->ref_handle);
 }
 void interpreter::group2value(lua_State* L, group* pgroup) {
-	luaL_checkstack(L, 1, nullptr);
+	luaL_checkstack(L, 2, nullptr);
 	if (!pgroup || pgroup->ref_handle == 0)
 		lua_pushnil(L);
-	else
+	else if (!pgroup->weak)
 		lua_rawgeti(L, LUA_REGISTRYINDEX, pgroup->ref_handle);
+	else {
+		lua_rawgeti(L, LUA_REGISTRYINDEX, pgroup->pduel->lua->weak_groups);
+		lua_rawgeti(L, -1, pgroup->ref_handle);
+		lua_remove(L, -2);
+		// only the collector clears a weak group's slot, and only once no Lua value refers to it: C++ naming such a
+		// group held it nowhere, which hold_group exists to prevent
+		if(lua_isnil(L, -1))
+			mf_core_refusal("weak_group_invariant", "group2value: a weak group C++ still names was already collected");
+	}
 }
 void interpreter::effect2value(lua_State* L, effect* peffect) {
 	luaL_checkstack(L, 1, nullptr);
@@ -697,7 +823,8 @@ duel* interpreter::get_duel_info(lua_State* L) {
 	return pduel;
 }
 bool interpreter::is_load_script(const card_data& data) {
-	if(data.code == TEMP_CARD_ID)
+	// TEMP_CARD_ID and the reserved client placeholders (999000001-999000004) have no script.
+	if(data.code == TEMP_CARD_ID || (data.code >= 999000001u && data.code <= 999000004u))
 		return false;
 	return !(data.type & TYPE_NORMAL) || (data.type & TYPE_PENDULUM);
 }
